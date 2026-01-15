@@ -33,11 +33,6 @@ if [ -f conf/assignment.txt ]; then
     assignment=`cat conf/assignment.txt`
     if [ -f ./assignment-autotest/test/${assignment}/assignment-test.sh ]; then
         echo "Executing assignment test script"
-        # Patch sockettest.sh to increase timeout for Valgrind
-        if [ -f ./assignment-autotest/test/${assignment}/sockettest.sh ]; then
-             echo "Patching sockettest.sh to increase timeout to 10s"
-             sed -i 's/-w 1/-w 10/g' ./assignment-autotest/test/${assignment}/sockettest.sh
-        fi
         ./assignment-autotest/test/${assignment}/assignment-test.sh $test_dir
         rc=$?
         if [ $rc -eq 0 ]; then
