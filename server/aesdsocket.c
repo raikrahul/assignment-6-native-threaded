@@ -14,13 +14,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT 9000
@@ -39,7 +43,7 @@ volatile sig_atomic_t shutdown_requested = 0;
 
 /* Global socket fd for cleanup in signal handler */
 int server_fd = -1;
-
+pthread_mutex_t file_mutex;
 /*
  * Signal handler for SIGINT (Ctrl+C) and SIGTERM (kill)
  * AXIOM: Signal handler must be async-signal-safe
@@ -54,14 +58,26 @@ void signal_handler(int sig) {
     server_fd = -1;
   }
 }
+struct slist_data_s {
+  SLIST_ENTRY(slist_data_s) entries;
+  int client_fd;
+  pthread_t thread;
+  int thread_complete;
+};
+
+void *thread_function(void *thread_param);
+void *timer_thread(void *timer_param);
 
 int main(int argc, char *argv[]) {
   int daemon_mode = 0;
   int client_fd = -1;
   struct sockaddr_in server_addr, client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
+  pthread_mutex_init(&file_mutex, NULL);
   char client_ip[INET_ADDRSTRLEN]; /* 16 bytes: "255.255.255.255\0" */
 
+  SLIST_HEAD(slistthread, slist_data_s) head;
+  SLIST_INIT(&head);
   /*
    * AXIOM: argc = argument count, argv[0] = program name
    * - argc=1: just "./aesdsocket"
@@ -221,6 +237,10 @@ int main(int argc, char *argv[]) {
    * - Returns new fd for client communication
    * - client_addr is filled with client IP/port
    */
+
+  pthread_t timer_id;
+  pthread_create(&timer_id, NULL, timer_thread, NULL);
+
   while (!shutdown_requested) {
 
     client_fd =
@@ -236,114 +256,167 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
+    struct slist_data_s *datap = malloc(sizeof(struct slist_data_s));
+    datap->client_fd = client_fd;
+    datap->thread_complete = 0;
+    if (pthread_create(&datap->thread, NULL, thread_function, datap) != 0) {
+      syslog(LOG_ERR, "pthread_create() failed: %s", strerror(errno));
+      close(client_fd);
+      free(datap);
+      continue;
+    }
+    SLIST_INSERT_HEAD(&head, datap, entries);
+
     /* Convert binary IP to string for logging */
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
     syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-    /* Check for shutdown before processing client */
-    if (shutdown_requested) {
-      close(client_fd);
-      break;
-    }
-
-    /* ============================================================
-     * TODO BLOCK 7: RECEIVE DATA & WRITE TO FILE
-     * ============================================================
-     * AXIOM: recv(client_fd, buffer, size, flags)
-     * - Returns bytes received (0 = client closed, -1 = error)
-     * - Buffer until '\n' found
-     * - Append to /var/tmp/aesdsocketdata
-     *
-     * REAL DATA EXAMPLE:
-     * - Client sends: "Hello\nWorld\n"
-     * - recv() might return: "Hell" (4 bytes)
-     * - recv() might return: "o\nWor" (5 bytes) <- '\n' found at index 1
-     * - Write "Hello\n" to file
-     * - Buffer "Wor" for next iteration
-     * - recv() might return: "ld\n" (3 bytes) <- '\n' found at index 2
-     * - Write "World\n" to file
-     *
-     * TRAP: Must handle partial receives
-     * TRAP: realloc() if buffer too small
-     *
-     * YOUR CODE HERE:
-     */
-    char *recv_buffer = malloc(BUFFER_SIZE);
-    if (!recv_buffer) {
-      syslog(LOG_ERR, "malloc() failed");
-      close(client_fd);
-      continue;
-    }
-
-    size_t buffer_size = BUFFER_SIZE;
-    size_t total_received = 0;
-    ssize_t bytes_received;
-
-    while ((bytes_received = recv(client_fd, recv_buffer + total_received,
-                                  buffer_size - total_received - 1, 0)) > 0) {
-      total_received += bytes_received;
-      recv_buffer[total_received] = '\0';
-
-      /* Check for newline - packet complete */
-      char *newline_pos;
-      while ((newline_pos = strchr(recv_buffer, '\n')) != NULL) {
-        size_t packet_len = newline_pos - recv_buffer + 1; /* Include '\n' */
-
-        /* Write packet to file - open with O_RDWR to read back without
-         * reopening */
-        int file_fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-        if (file_fd == -1) {
-          syslog(LOG_ERR, "open() failed: %s", strerror(errno));
-        } else {
-          if (write(file_fd, recv_buffer, packet_len) == -1) {
-            syslog(LOG_ERR, "write() failed: %s", strerror(errno));
-          }
-
-          /* Seek to beginning and send entire file to client */
-          lseek(file_fd, 0, SEEK_SET);
-          char send_buffer[BUFFER_SIZE];
-          ssize_t bytes_read;
-          while ((bytes_read =
-                      read(file_fd, send_buffer, sizeof(send_buffer))) > 0) {
-            send(client_fd, send_buffer, bytes_read, 0);
-          }
-          close(file_fd);
-        }
-
-        /* Shift remaining data to start of buffer */
-        size_t remaining = total_received - packet_len;
-        memmove(recv_buffer, newline_pos + 1, remaining);
-        total_received = remaining;
-        recv_buffer[total_received] = '\0';
+    /* Cleanup finished threads (non-blocking) */
+    struct slist_data_s *iter_datap = SLIST_FIRST(&head);
+    while (iter_datap != NULL) {
+      struct slist_data_s *next_datap = SLIST_NEXT(iter_datap, entries);
+      if (iter_datap->thread_complete == 1) {
+        pthread_join(iter_datap->thread, NULL);
+        SLIST_REMOVE(&head, iter_datap, slist_data_s, entries);
+        free(iter_datap);
       }
-
-      /* Resize buffer if needed */
-      if (total_received >= buffer_size - 1) {
-        buffer_size *= 2;
-        char *new_buffer = realloc(recv_buffer, buffer_size);
-        if (!new_buffer) {
-          syslog(LOG_ERR, "realloc() failed");
-          break;
-        }
-        recv_buffer = new_buffer;
-      }
+      iter_datap = next_datap;
     }
-
-    free(recv_buffer);
-    close(client_fd);
-    syslog(LOG_INFO, "Closed connection from %s", client_ip);
   }
 
   /* ================================================================
    * CLEANUP: Signal received, graceful shutdown
    * ================================================================
    */
+  struct slist_data_s *iter_datap = SLIST_FIRST(&head);
+  while (iter_datap != NULL) {
+    struct slist_data_s *temp_datap = SLIST_NEXT(iter_datap, entries);
+    pthread_join(iter_datap->thread, NULL);
+    SLIST_REMOVE(&head, iter_datap, slist_data_s, entries);
+    free(iter_datap);
+    iter_datap = temp_datap;
+  }
+
+  pthread_join(timer_id, NULL);
+
   syslog(LOG_INFO, "Caught signal, exiting");
   if (server_fd != -1) {
     close(server_fd);
   }
   remove(DATA_FILE);
   closelog();
+  pthread_mutex_destroy(&file_mutex);
 
   return 0;
+}
+
+void *thread_function(void *thread_param) {
+  struct slist_data_s *thread_func_args = (struct slist_data_s *)thread_param;
+  int client_fd = thread_func_args->client_fd;
+
+  char *recv_buffer = malloc(BUFFER_SIZE);
+  if (!recv_buffer) {
+    syslog(LOG_ERR, "malloc() failed");
+    close(client_fd);
+    thread_func_args->thread_complete = 1;
+    return NULL;
+  }
+
+  size_t buffer_size = BUFFER_SIZE;
+  size_t total_received = 0;
+  ssize_t bytes_received;
+
+  while ((bytes_received = recv(client_fd, recv_buffer + total_received,
+                                buffer_size - total_received - 1, 0)) > 0) {
+    total_received += bytes_received;
+    recv_buffer[total_received] = '\0';
+
+    char *newline_pos;
+    while ((newline_pos = strchr(recv_buffer, '\n')) != NULL) {
+      size_t packet_len = newline_pos - recv_buffer + 1;
+
+      /* CRITICAL SECTION START */
+      if (pthread_mutex_lock(&file_mutex) != 0) {
+        syslog(LOG_ERR, "mutex lock failed");
+        // Handle error, maybe break
+      }
+
+      int file_fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+      if (file_fd == -1) {
+        syslog(LOG_ERR, "open() failed: %s", strerror(errno));
+      } else {
+        if (write(file_fd, recv_buffer, packet_len) == -1) {
+          syslog(LOG_ERR, "write() failed: %s", strerror(errno));
+        }
+
+        lseek(file_fd, 0, SEEK_SET);
+        char send_buffer[BUFFER_SIZE];
+        ssize_t bytes_read;
+        while ((bytes_read = read(file_fd, send_buffer, sizeof(send_buffer))) >
+               0) {
+          send(client_fd, send_buffer, bytes_read, 0);
+        }
+        close(file_fd);
+      }
+
+      if (pthread_mutex_unlock(&file_mutex) != 0) {
+        syslog(LOG_ERR, "mutex unlock failed");
+      }
+      /* CRITICAL SECTION END */
+
+      size_t remaining = total_received - packet_len;
+      memmove(recv_buffer, newline_pos + 1, remaining);
+      total_received = remaining;
+      recv_buffer[total_received] = '\0';
+    }
+
+    if (total_received >= buffer_size - 1) {
+      buffer_size *= 2;
+      char *new_buffer = realloc(recv_buffer, buffer_size);
+      if (!new_buffer) {
+        syslog(LOG_ERR, "realloc() failed");
+        break;
+      }
+      recv_buffer = new_buffer;
+    }
+  }
+
+  free(recv_buffer);
+  close(client_fd);
+  thread_func_args->thread_complete = 1;
+  return NULL;
+}
+
+void *timer_thread(void *timer_param) {
+
+  while (!shutdown_requested) {
+    if (sleep(10) != 0)
+      break;
+
+    time_t now;
+    struct tm *tm_info;
+    char time_str[128];
+
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %T %z\n",
+             tm_info);
+
+    if (pthread_mutex_lock(&file_mutex) != 0) {
+      syslog(LOG_ERR, "mutex lock failed");
+    }
+    int file_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (file_fd == -1) {
+      syslog(LOG_ERR, "open() failed: %s", strerror(errno));
+    } else {
+      if (write(file_fd, time_str, strlen(time_str)) == -1) {
+        syslog(LOG_ERR, "write() failed: %s", strerror(errno));
+      }
+      close(file_fd);
+    }
+    if (pthread_mutex_unlock(&file_mutex) != 0) {
+      syslog(LOG_ERR, "mutex unlock failed");
+    }
+  }
+  return NULL;
 }
