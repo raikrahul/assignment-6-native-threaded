@@ -1,0 +1,13 @@
+#!/bin/sh
+
+case "$1" in 
+    start )
+    start-stop-daemon --start --exec /usr/bin/aesdsocket -- -d
+    ;;
+    stop )
+    start-stop-daemon --stop --signal TERM --exec /usr/bin/aesdsocket
+    ;;
+    *)
+    exit 1
+    ;;
+esac
