@@ -244,8 +244,7 @@ void *thread_function(void *thread_param) {
 void *timer_thread(void *timer_param) {
 
   while (!shutdown_requested) {
-    if (sleep(10) != 0)
-      break;
+    sleep(10);
 
     time_t now;
     struct tm *tm_info;
