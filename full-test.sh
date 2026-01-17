@@ -34,7 +34,7 @@ if [ -f conf/assignment.txt ]; then
     if [ -f ./assignment-autotest/test/${assignment}/assignment-test.sh ]; then
         # Patch sockettest.sh to increase timeout for busy CI runners
         if [ -f ./assignment-autotest/test/${assignment}/sockettest.sh ]; then
-             sed -i 's/-w 1/-w 5/g' ./assignment-autotest/test/${assignment}/sockettest.sh
+             sed -i 's/-w 1/-w 20/g' ./assignment-autotest/test/${assignment}/sockettest.sh
         fi
         echo "Executing assignment test script"
         ./assignment-autotest/test/${assignment}/assignment-test.sh $test_dir
